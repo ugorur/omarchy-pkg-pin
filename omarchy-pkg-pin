@@ -1,0 +1,807 @@
+#!/bin/bash
+# Pin individual packages to an Omarchy channel (stable, rc, or edge).
+# The system channel stays as-is; pinned packages are ignored by that
+# channel and installed from a downloaded package on the requested one.
+#
+# Extra pacman repos cannot be used for this: a section named extra-rc
+# makes pacman fetch extra-rc.db, but Omarchy mirrors still publish extra.db.
+
+set -euo pipefail
+
+PROG=omarchy-pkg-pin
+VALID_CHANNELS=(stable rc edge)
+WARN_PKGS=(pacman glibc linux linux-headers linux-lts systemd filesystem omarchy omarchy-settings omarchy-dev omarchy-settings-dev)
+BEGIN_MARK="# omarchy-pkg-pin begin"
+END_MARK="# omarchy-pkg-pin end"
+OLD_REPOS_FILE=/etc/pacman.d/omarchy-pkg-pin.repos.conf
+OLD_INCLUDE_LINE="Include = ${OLD_REPOS_FILE}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-pkg-pin add <package> <stable|rc|edge>
+  omarchy-pkg-pin remove <package>
+  omarchy-pkg-pin list
+  omarchy-pkg-pin sync
+  omarchy-pkg-pin apply-config
+  omarchy-pkg-pin setup
+  omarchy-pkg-pin status
+
+Pin selected packages to a different Omarchy channel than the rest of
+the system. Unpinned packages keep following `omarchy channel`.
+
+  add           Remember a pin, write IgnorePkg, install from that channel
+  remove        Drop a pin and let the package follow the system channel again
+  list          Show pins and whether they currently match the target
+  sync          Rewrite pacman config and upgrade pinned packages from their channel
+  apply-config  Only rewrite IgnorePkg (used by hooks)
+  setup         Install hooks so pins survive `omarchy channel set` and updates
+  status        Current system channel, pins, and hook state
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+is_channel() {
+  local c=$1
+  [[ $c == stable || $c == rc || $c == edge ]]
+}
+
+warn_if_risky() {
+  local pkg=$1
+  local p
+  for p in "${WARN_PKGS[@]}"; do
+    if [[ $pkg == "$p" ]]; then
+      echo "Warning: pinning '$pkg' across channels can leave the system unable to boot or upgrade." >&2
+      return 0
+    fi
+  done
+}
+
+resolve_home() {
+  if [[ -n ${PIN_HOME:-} ]]; then
+    printf '%s\n' "$PIN_HOME"
+    return
+  fi
+  if [[ ${EUID} -eq 0 && -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
+    getent passwd "$SUDO_USER" | cut -d: -f6
+    return
+  fi
+  printf '%s\n' "${HOME}"
+}
+
+init_paths() {
+  PIN_HOME=$(resolve_home)
+  PIN_DIR="${PIN_HOME}/.config/omarchy/pkg-pin"
+  PIN_FILE="${PIN_DIR}/pins"
+  CACHE_DIR="${PIN_HOME}/.cache/omarchy-pkg-pin"
+  HOOK_PRE="${PIN_HOME}/.config/omarchy/hooks/pre-refresh-pacman.d/pkg-pin"
+  HOOK_POST="${PIN_HOME}/.config/omarchy/hooks/post-update.d/pkg-pin"
+  BIN_PATH="${PIN_HOME}/.local/bin/omarchy-pkg-pin"
+}
+
+as_root() {
+  if [[ ${EUID} -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+need_root() {
+  if [[ ${EUID} -eq 0 ]]; then
+    return 0
+  fi
+  if sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  die "this step writes /etc and needs sudo. Run it in a terminal so you can enter your password."
+}
+
+host_arch() {
+  local a
+  a=$(pacman-conf Architecture 2>/dev/null | awk 'NR==1{print; exit}')
+  if [[ -n $a && $a != auto ]]; then
+    printf '%s\n' "$a"
+    return
+  fi
+  uname -m
+}
+
+current_channel() {
+  local ch
+  if command -v omarchy-channel-current >/dev/null 2>&1; then
+    ch=$(omarchy-channel-current 2>/dev/null || true)
+    if is_channel "$ch"; then
+      printf '%s\n' "$ch"
+      return
+    fi
+  fi
+  if [[ -r /etc/pacman.d/mirrorlist ]]; then
+    if grep -q 'stable-mirror.omarchy.org' /etc/pacman.d/mirrorlist; then
+      echo stable
+      return
+    fi
+    if grep -q 'rc-mirror.omarchy.org' /etc/pacman.d/mirrorlist; then
+      echo rc
+      return
+    fi
+    if grep -q 'mirror.omarchy.org' /etc/pacman.d/mirrorlist; then
+      echo edge
+      return
+    fi
+  fi
+  echo unknown
+}
+
+arch_family_base() {
+  local ch=$1 family=$2
+  local arch
+  arch=$(host_arch)
+  case "$ch" in
+    stable) printf 'https://stable-mirror.omarchy.org/%s/os/%s\n' "$family" "$arch" ;;
+    rc) printf 'https://rc-mirror.omarchy.org/%s/os/%s\n' "$family" "$arch" ;;
+    edge) printf 'https://mirror.omarchy.org/%s/os/%s\n' "$family" "$arch" ;;
+    *) die "unknown channel: $ch" ;;
+  esac
+}
+
+omarchy_base() {
+  local ch=$1
+  local arch
+  arch=$(host_arch)
+  case "$ch" in
+    stable) printf 'https://pkgs.omarchy.org/stable/%s\n' "$arch" ;;
+    rc | edge) printf 'https://pkgs.omarchy.org/edge/%s\n' "$arch" ;;
+    *) die "unknown channel: $ch" ;;
+  esac
+}
+
+ensure_pin_file() {
+  mkdir -p "$PIN_DIR"
+  if [[ ! -f $PIN_FILE ]]; then
+    cat >"$PIN_FILE" <<'EOF'
+# Package channel pins for omarchy-pkg-pin.
+# Format: <package>  <stable|rc|edge>
+EOF
+  fi
+}
+
+# Prints "pkg<TAB>channel" lines. Last assignment wins; order is first seen.
+read_pins() {
+  ensure_pin_file
+  awk '
+    BEGIN { FS = "[ \t]+" }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      pkg = $1
+      ch = $2
+      if (pkg == "" || ch == "") next
+      if (!(pkg in order)) {
+        n++
+        pkgs[n] = pkg
+        order[pkg] = n
+      }
+      channel[pkg] = ch
+    }
+    END {
+      for (i = 1; i <= n; i++) print pkgs[i] "\t" channel[pkgs[i]]
+    }
+  ' "$PIN_FILE"
+}
+
+write_pins() {
+  local tmp
+  tmp=$(mktemp)
+  {
+    cat <<'EOF'
+# Package channel pins for omarchy-pkg-pin.
+# Format: <package>  <stable|rc|edge>
+# Managed file — add/remove via omarchy-pkg-pin.
+EOF
+    if ((${#new_pkgs[@]})); then
+      local i
+      for i in "${!new_pkgs[@]}"; do
+        printf '%s  %s\n' "${new_pkgs[$i]}" "${new_channels[$i]}"
+      done
+    fi
+  } >"$tmp"
+  mkdir -p "$PIN_DIR"
+  mv "$tmp" "$PIN_FILE"
+}
+
+load_pins_into_arrays() {
+  new_pkgs=()
+  new_channels=()
+  local pkg ch
+  while IFS=$'\t' read -r pkg ch; do
+    [[ -z $pkg ]] && continue
+    new_pkgs+=("$pkg")
+    new_channels+=("$ch")
+  done < <(read_pins)
+}
+
+set_pin() {
+  local pkg=$1 ch=$2 i
+  load_pins_into_arrays
+  for i in "${!new_pkgs[@]}"; do
+    if [[ ${new_pkgs[$i]} == "$pkg" ]]; then
+      new_channels[$i]=$ch
+      write_pins
+      return
+    fi
+  done
+  new_pkgs+=("$pkg")
+  new_channels+=("$ch")
+  write_pins
+}
+
+unset_pin() {
+  local pkg=$1 i
+  local found=0
+  local keep_pkgs=() keep_channels=()
+  load_pins_into_arrays
+  for i in "${!new_pkgs[@]}"; do
+    if [[ ${new_pkgs[$i]} == "$pkg" ]]; then
+      found=1
+      continue
+    fi
+    keep_pkgs+=("${new_pkgs[$i]}")
+    keep_channels+=("${new_channels[$i]}")
+  done
+  ((found)) || die "package '$pkg' is not pinned"
+  new_pkgs=("${keep_pkgs[@]+"${keep_pkgs[@]}"}")
+  new_channels=("${keep_channels[@]+"${keep_channels[@]}"}")
+  write_pins
+}
+
+needed_channels() {
+  local sys=$1 pkg ch
+  declare -A seen=()
+  while IFS=$'\t' read -r pkg ch; do
+    [[ -z $pkg ]] && continue
+    is_channel "$ch" || continue
+    if [[ $ch != "$sys" ]]; then
+      seen[$ch]=1
+    fi
+  done < <(read_pins)
+  local c
+  for c in "${VALID_CHANNELS[@]}"; do
+    [[ -n ${seen[$c]+x} ]] && printf '%s\n' "$c"
+  done
+}
+
+ignore_packages() {
+  local sys=$1 pkg ch
+  while IFS=$'\t' read -r pkg ch; do
+    [[ -z $pkg ]] && continue
+    is_channel "$ch" || continue
+    if [[ $ch != "$sys" ]]; then
+      printf '%s\n' "$pkg"
+    fi
+  done < <(read_pins)
+}
+
+strip_managed() {
+  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" -v inc_line="$OLD_INCLUDE_LINE" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    skip { next }
+    $0 == inc_line { next }
+    { print }
+  ' "$1"
+}
+
+build_pacman_conf() {
+  local sys=$1 src=$2
+  local ignores=() pkg
+  while IFS= read -r pkg; do
+    [[ -n $pkg ]] && ignores+=("$pkg")
+  done < <(ignore_packages "$sys")
+
+  local tmp cleaned
+  cleaned=$(mktemp)
+  strip_managed "$src" >"$cleaned"
+  tmp=$(mktemp)
+  awk 'BEGIN{blank=0} /^$/{blank++; if(blank<=2) print; next} {blank=0; print}' "$cleaned" >"$tmp"
+  mv "$tmp" "$cleaned"
+
+  if ((${#ignores[@]})); then
+    tmp=$(mktemp)
+    {
+      echo "$BEGIN_MARK"
+      printf 'IgnorePkg = %s\n' "${ignores[@]}"
+      echo "$END_MARK"
+      echo
+    } >"${tmp}.block"
+    awk -v block_file="${tmp}.block" '
+      BEGIN { inserted = 0 }
+      /^\[core\]$/ && !inserted {
+        while ((getline line < block_file) > 0) print line
+        close(block_file)
+        inserted = 1
+      }
+      { print }
+      END {
+        if (!inserted) {
+          print ""
+          while ((getline line < block_file) > 0) print line
+        }
+      }
+    ' "$cleaned" >"$tmp"
+    rm -f "${tmp}.block"
+    mv "$tmp" "$cleaned"
+  fi
+
+  cat "$cleaned"
+  rm -f "$cleaned"
+}
+
+install_file() {
+  local src=$1 dest=$2 mode=${3:-644}
+  as_root install -D -m "$mode" "$src" "$dest"
+}
+
+write_pacman_conf() {
+  local sys
+  sys=$(current_channel)
+  is_channel "$sys" || die "could not detect the current Omarchy channel (got '$sys')"
+
+  local conf_tmp live
+  conf_tmp=$(mktemp)
+  live=$(mktemp)
+  as_root cat /etc/pacman.conf >"$live"
+  build_pacman_conf "$sys" "$live" >"$conf_tmp"
+  install_file "$conf_tmp" /etc/pacman.conf 644
+  as_root rm -f "$OLD_REPOS_FILE"
+  rm -f "$conf_tmp" "$live"
+}
+
+fetch_url() {
+  local url=$1 dest=$2
+  curl -fsSL --retry 3 --retry-delay 1 -o "$dest" "$url"
+}
+
+lookup_in_db() {
+  local db=$1 pkg=$2
+  tar -xOf "$db" --wildcards '*/desc' 2>/dev/null | awk -v want="$pkg" '
+    function emit() {
+      if (found) return
+      if (name == want && fn != "") {
+        printf "%s\t%s\t%s\n", fn, ver, sha
+        found = 1
+      }
+    }
+    /^%FILENAME%$/{ emit(); f=1; name=""; ver=""; sha=""; fn=""; next }
+    f { fn=$0; f=0; next }
+    /^%NAME%$/{ n=1; next }
+    n { name=$0; n=0; next }
+    /^%VERSION%$/{ v=1; next }
+    v { ver=$0; v=0; next }
+    /^%SHA256SUM%$/{ s=1; next }
+    s { sha=$0; s=0; next }
+    END { emit() }
+  '
+}
+
+ensure_db() {
+  local ch=$1 family=$2
+  local url dest
+  mkdir -p "$CACHE_DIR"
+  dest="${CACHE_DIR}/${ch}-${family}.db"
+  if [[ $family == omarchy ]]; then
+    url="$(omarchy_base "$ch")/omarchy.db"
+  else
+    url="$(arch_family_base "$ch" "$family")/${family}.db"
+  fi
+  if [[ -f $dest ]]; then
+    local age
+    age=$(($(date +%s) - $(stat -c %Y "$dest")))
+    if ((age < 3600)); then
+      printf '%s\n' "$dest"
+      return 0
+    fi
+  fi
+  if ! fetch_url "$url" "${dest}.tmp"; then
+    rm -f "${dest}.tmp"
+    return 1
+  fi
+  mv "${dest}.tmp" "$dest"
+  printf '%s\n' "$dest"
+}
+
+# Prints: family<TAB>filename<TAB>version<TAB>sha256<TAB>url
+resolve_remote_package() {
+  local pkg=$1 ch=$2
+  local family db hit fn ver sha url
+  for family in extra omarchy core multilib; do
+    db=$(ensure_db "$ch" "$family") || continue
+    hit=$(lookup_in_db "$db" "$pkg" || true)
+    [[ -n $hit ]] || continue
+    IFS=$'\t' read -r fn ver sha <<<"$hit"
+    if [[ $family == omarchy ]]; then
+      url="$(omarchy_base "$ch")/${fn}"
+    else
+      url="$(arch_family_base "$ch" "$family")/${fn}"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$family" "$fn" "$ver" "$sha" "$url"
+    return 0
+  done
+  return 1
+}
+
+installed_version() {
+  pacman -Q "$1" 2>/dev/null | awk '{print $2}'
+}
+
+cmd_apply_config() {
+  need_root
+  write_pacman_conf
+  echo "Wrote package pin configuration for channel $(current_channel)."
+}
+
+cmd_sync() {
+  need_root
+  write_pacman_conf
+  local sys
+  sys=$(current_channel)
+
+  local pkg ch info family fn ver sha url inst dest
+  local synced=0
+  mkdir -p "$CACHE_DIR"
+  while IFS=$'\t' read -r pkg ch; do
+    [[ -z $pkg ]] && continue
+    is_channel "$ch" || {
+      echo "Warning: ignoring invalid pin '$pkg' -> '$ch'" >&2
+      continue
+    }
+    if ! info=$(resolve_remote_package "$pkg" "$ch"); then
+      echo "Warning: '$pkg' was not found on the $ch channel." >&2
+      continue
+    fi
+    IFS=$'\t' read -r family fn ver sha url <<<"$info"
+    inst=$(installed_version "$pkg" || true)
+    if [[ $inst == "$ver" ]]; then
+      echo "OK  $pkg  $ch  $ver  ($family)"
+      continue
+    fi
+    echo "Install $pkg $ver from $ch/$family  [installed: ${inst:-none}]"
+    dest="${CACHE_DIR}/${fn}"
+    echo "  downloading $url"
+    fetch_url "$url" "$dest"
+    if [[ -n $sha ]]; then
+      echo "$sha  $dest" | sha256sum -c --status || die "checksum mismatch for $fn"
+    fi
+    as_root pacman -U --noconfirm --needed "$dest"
+    synced=$((synced + 1))
+  done < <(read_pins)
+
+  if ((synced == 0)); then
+    echo "Pinned packages already match their channels."
+  fi
+}
+
+cmd_add() {
+  local pkg=${1:-} ch=${2:-}
+  [[ -n $pkg && -n $ch ]] || die "usage: $PROG add <package> <stable|rc|edge>"
+  is_channel "$ch" || die "channel must be stable, rc, or edge"
+  [[ $pkg =~ ^[a-zA-Z0-9][a-zA-Z0-9+._@-]*$ ]] || die "invalid package name: $pkg"
+  warn_if_risky "$pkg"
+  if ! pacman -Si "$pkg" >/dev/null 2>&1 && ! pacman -Q "$pkg" >/dev/null 2>&1; then
+    echo "Warning: '$pkg' is not installed and not in the current databases." >&2
+  fi
+  set_pin "$pkg" "$ch"
+  echo "Pinned $pkg -> $ch"
+  if [[ ! -x $HOOK_PRE || ! -x $HOOK_POST ]]; then
+    echo "Hint: run '$PROG setup' so pins survive omarchy channel set / update."
+  fi
+  cmd_sync
+}
+
+cmd_remove() {
+  local pkg=${1:-}
+  [[ -n $pkg ]] || die "usage: $PROG remove <package>"
+  unset_pin "$pkg"
+  echo "Removed pin for $pkg"
+  if [[ ${EUID} -eq 0 ]] || sudo -n true 2>/dev/null; then
+    cmd_sync
+  else
+    echo "Pin dropped. Run '$PROG sync' (with sudo) to clear IgnorePkg and follow the system channel."
+  fi
+}
+
+cmd_list() {
+  local sys
+  sys=$(current_channel)
+  local pkg ch inst ver status family info
+  local any=0
+  printf '%-28s %-8s %-22s %-22s %s\n' PACKAGE CHANNEL INSTALLED TARGET STATUS
+  while IFS=$'\t' read -r pkg ch; do
+    [[ -z $pkg ]] && continue
+    any=1
+    inst=$(installed_version "$pkg" || echo '-')
+    if info=$(resolve_remote_package "$pkg" "$ch" 2>/dev/null); then
+      IFS=$'\t' read -r family _ ver _ _ <<<"$info"
+    else
+      family=?
+      ver='-'
+    fi
+    if [[ $ch == "$sys" ]]; then
+      status="system-channel"
+    elif [[ $inst == "$ver" && $ver != '-' ]]; then
+      status="in-sync"
+    elif [[ $inst == '-' ]]; then
+      status="not-installed"
+    else
+      status="needs-sync"
+    fi
+    printf '%-28s %-8s %-22s %-22s %s\n' "$pkg" "$ch" "$inst" "$ver" "$status"
+  done < <(read_pins)
+  if ((any == 0)); then
+    echo "(no pins)"
+  fi
+}
+
+write_user_hooks() {
+  mkdir -p "$(dirname "$HOOK_PRE")" "$(dirname "$HOOK_POST")"
+  cat >"$HOOK_PRE" <<EOF
+#!/bin/bash
+# Re-apply package channel pins after omarchy rewrites /etc/pacman.conf.
+exec "$BIN_PATH" apply-config --home "$PIN_HOME"
+EOF
+  cat >"$HOOK_POST" <<EOF
+#!/bin/bash
+# After omarchy update, pull pinned packages from their channels.
+exec "$BIN_PATH" sync --home "$PIN_HOME"
+EOF
+  chmod 755 "$HOOK_PRE" "$HOOK_POST"
+}
+
+cmd_setup() {
+  ensure_pin_file
+  mkdir -p "${PIN_HOME}/.local/bin"
+  if [[ ! -x $BIN_PATH ]]; then
+    die "CLI missing or not executable: $BIN_PATH"
+  fi
+  write_user_hooks
+  echo "Installed hooks:"
+  echo "  $HOOK_PRE"
+  echo "  $HOOK_POST"
+
+  if [[ ${EUID} -eq 0 ]] || sudo -n true 2>/dev/null; then
+    write_pacman_conf
+    echo "Pins will be re-applied before omarchy channel changes and after omarchy updates."
+  else
+    echo
+    echo "User hooks are in place. Adding a pin still needs sudo once:"
+    echo "  $PROG add <package> <stable|rc|edge>"
+  fi
+}
+
+cmd_status() {
+  local sys
+  sys=$(current_channel)
+  echo "System channel: $sys"
+  echo "Pin file:       $PIN_FILE"
+  echo "IgnorePkg:      $(awk '/^# omarchy-pkg-pin begin$/{p=1;next} /^# omarchy-pkg-pin end$/{p=0} p && /^IgnorePkg/{print}' /etc/pacman.conf | sed 's/IgnorePkg = //' | paste -sd',' - || true)"
+  echo "Pre hook:       $([[ -x $HOOK_PRE ]] && echo present || echo missing)"
+  echo "Post hook:      $([[ -x $HOOK_POST ]] && echo present || echo missing)"
+  echo
+  cmd_list
+}
+
+cmd_selftest() {
+  local fail=0
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  PIN_HOME=$tmpdir
+  PIN_DIR="${PIN_HOME}/.config/omarchy/pkg-pin"
+  PIN_FILE="${PIN_DIR}/pins"
+  mkdir -p "$PIN_DIR"
+  cat >"$PIN_FILE" <<'EOF'
+# comment
+hyprland  rc
+firefox   edge
+omarchy   stable
+hyprland  edge
+EOF
+  local got expect
+  got=$(read_pins | paste -sd'|' -)
+  expect=$'hyprland\tedge|firefox\tedge|omarchy\tstable'
+  if [[ $got != "$expect" ]]; then
+    echo "FAIL read_pins: [$got] != [$expect]"
+    fail=1
+  else
+    echo "OK   read_pins"
+  fi
+
+  local sys=stable
+  got=$(needed_channels "$sys" | paste -sd',' -)
+  if [[ $got != "edge" ]]; then
+    echo "FAIL needed_channels: [$got] != [edge]"
+    fail=1
+  else
+    echo "OK   needed_channels"
+  fi
+
+  got=$(ignore_packages "$sys" | paste -sd',' -)
+  if [[ $got != "hyprland,firefox" ]]; then
+    echo "FAIL ignore_packages: [$got] != [hyprland,firefox]"
+    fail=1
+  else
+    echo "OK   ignore_packages"
+  fi
+
+  if [[ $(arch_family_base rc extra) != "https://rc-mirror.omarchy.org/extra/os/$(host_arch)" ]]; then
+    echo "FAIL arch_family_base rc extra: $(arch_family_base rc extra)"
+    fail=1
+  else
+    echo "OK   arch_family_base"
+  fi
+
+  if [[ $(omarchy_base rc) != "$(omarchy_base edge)" ]]; then
+    echo "FAIL omarchy rc/edge should share pkgs.omarchy.org/edge"
+    fail=1
+  else
+    echo "OK   omarchy_base rc==edge"
+  fi
+
+  local fake_db
+  fake_db=$(mktemp -d)
+  mkdir -p "$fake_db/telegram-desktop-7.0.9-4"
+  cat >"$fake_db/telegram-desktop-7.0.9-4/desc" <<'EOF'
+%FILENAME%
+telegram-desktop-7.0.9-4-x86_64.pkg.tar.zst
+
+%NAME%
+telegram-desktop
+
+%VERSION%
+7.0.9-4
+
+%SHA256SUM%
+abc123
+EOF
+  mkdir -p "$fake_db/telegram-desktop-foo-1"
+  cat >"$fake_db/telegram-desktop-foo-1/desc" <<'EOF'
+%FILENAME%
+telegram-desktop-foo-1-x86_64.pkg.tar.zst
+
+%NAME%
+telegram-desktop-foo
+
+%VERSION%
+1-1
+EOF
+  tar -C "$fake_db" -cf "$fake_db/extra.db" telegram-desktop-7.0.9-4 telegram-desktop-foo-1
+  got=$(lookup_in_db "$fake_db/extra.db" telegram-desktop)
+  expect=$'telegram-desktop-7.0.9-4-x86_64.pkg.tar.zst\t7.0.9-4\tabc123'
+  if [[ $got != "$expect" ]]; then
+    echo "FAIL lookup_in_db: [$got] != [$expect]"
+    fail=1
+  else
+    echo "OK   lookup_in_db"
+  fi
+  rm -rf "$fake_db"
+
+  local fake_conf built
+  fake_conf=$(mktemp)
+  cat >"$fake_conf" <<EOF
+[options]
+HoldPkg = pacman glibc
+$BEGIN_MARK
+IgnorePkg = stale-pkg
+$END_MARK
+
+$OLD_INCLUDE_LINE
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+EOF
+  built=$(build_pacman_conf "$sys" "$fake_conf")
+  rm -f "$fake_conf"
+  if ! grep -q 'IgnorePkg = hyprland' <<<"$built"; then
+    echo "FAIL build_pacman_conf missing IgnorePkg hyprland"
+    fail=1
+  elif ! grep -q 'IgnorePkg = firefox' <<<"$built"; then
+    echo "FAIL build_pacman_conf missing IgnorePkg firefox"
+    fail=1
+  elif grep -q 'IgnorePkg = omarchy' <<<"$built"; then
+    echo "FAIL build_pacman_conf should not ignore same-channel pin"
+    fail=1
+  elif grep -q 'stale-pkg' <<<"$built"; then
+    echo "FAIL build_pacman_conf did not strip previous pin block"
+    fail=1
+  elif grep -q "$OLD_INCLUDE_LINE" <<<"$built"; then
+    echo "FAIL build_pacman_conf left extra-repo include"
+    fail=1
+  else
+    echo "OK   build_pacman_conf"
+  fi
+
+  cat >"$PIN_FILE" <<'EOF'
+# none
+EOF
+  fake_conf=$(mktemp)
+  cat >"$fake_conf" <<EOF
+[options]
+HoldPkg = pacman glibc
+$BEGIN_MARK
+IgnorePkg = leftover
+$END_MARK
+$OLD_INCLUDE_LINE
+[core]
+Include = /etc/pacman.d/mirrorlist
+EOF
+  built=$(build_pacman_conf "$sys" "$fake_conf")
+  rm -f "$fake_conf"
+  if grep -q 'leftover' <<<"$built"; then
+    echo "FAIL empty pins left leftover IgnorePkg"
+    fail=1
+  elif grep -q "$OLD_INCLUDE_LINE" <<<"$built"; then
+    echo "FAIL empty pins left extra-repo include"
+    fail=1
+  else
+    echo "OK   empty pins strip managed block"
+  fi
+
+  rm -rf "$tmpdir"
+  if ((fail)); then
+    die "selftest failed"
+  fi
+  echo "All tests passed."
+}
+
+parse_global_args() {
+  local out=()
+  while (($#)); do
+    case "$1" in
+      --home)
+        [[ -n ${2:-} ]] || die "--home needs a path"
+        PIN_HOME=$2
+        shift 2
+        ;;
+      --home=*)
+        PIN_HOME=${1#--home=}
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        out+=("$1")
+        shift
+        ;;
+    esac
+  done
+  PARSED_ARGS=("${out[@]+"${out[@]}"}")
+}
+
+parse_global_args "$@"
+set -- "${PARSED_ARGS[@]+"${PARSED_ARGS[@]}"}"
+init_paths
+
+cmd=${1:-}
+shift || true
+
+case "$cmd" in
+  add) cmd_add "$@" ;;
+  remove | rm | drop) cmd_remove "$@" ;;
+  list | ls) cmd_list ;;
+  sync) cmd_sync ;;
+  apply-config) cmd_apply_config ;;
+  setup) cmd_setup ;;
+  status) cmd_status ;;
+  selftest) cmd_selftest ;;
+  "" | -h | --help | help) usage ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
