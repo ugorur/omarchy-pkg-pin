@@ -98,7 +98,47 @@ need_root() {
   if sudo -n true 2>/dev/null; then
     return 0
   fi
+  # omarchy update runs in a TTY; refresh the ticket so post-update sync
+  # still works after a long pacman upgrade.
+  if [[ -t 0 ]]; then
+    sudo -v
+    return 0
+  fi
   die "this step writes /etc and needs sudo. Run it in a terminal so you can enter your password."
+}
+
+cache_owner_ids() {
+  stat -c '%u %g' "$PIN_HOME"
+}
+
+own_cache() {
+  local uid gid
+  read -r uid gid < <(cache_owner_ids)
+  if [[ ${EUID} -eq 0 ]]; then
+    mkdir -p "$CACHE_DIR"
+    chown -R "$uid:$gid" "$CACHE_DIR" 2>/dev/null || true
+    return 0
+  fi
+  if sudo -n true 2>/dev/null; then
+    sudo mkdir -p "$CACHE_DIR"
+    sudo chown -R "$uid:$gid" "$CACHE_DIR"
+  fi
+}
+
+ensure_cache_dir() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  if [[ -d $CACHE_DIR && -w $CACHE_DIR ]]; then
+    own_cache
+    return 0
+  fi
+  # Only take ownership when a sudo ticket already exists (sync/add).
+  # list/status must not prompt.
+  if [[ ${EUID} -eq 0 ]] || sudo -n true 2>/dev/null; then
+    as_root mkdir -p "$CACHE_DIR"
+    own_cache
+    return 0
+  fi
+  CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-pkg-pin.XXXXXX")
 }
 
 host_arch() {
@@ -318,9 +358,11 @@ build_pacman_conf() {
       echo "$END_MARK"
       echo
     } >"${tmp}.block"
+    # IgnorePkg is only valid in [options]: insert before the first repo
+    # section (e.g. [omarchy]), not before [core].
     awk -v block_file="${tmp}.block" '
       BEGIN { inserted = 0 }
-      /^\[core\]$/ && !inserted {
+      /^\[.*\]$/ && $0 != "[options]" && !inserted {
         while ((getline line < block_file) > 0) print line
         close(block_file)
         inserted = 1
@@ -391,14 +433,14 @@ lookup_in_db() {
 ensure_db() {
   local ch=$1 family=$2
   local url dest
-  mkdir -p "$CACHE_DIR"
+  ensure_cache_dir
   dest="${CACHE_DIR}/${ch}-${family}.db"
   if [[ $family == omarchy ]]; then
     url="$(omarchy_base "$ch")/omarchy.db"
   else
     url="$(arch_family_base "$ch" "$family")/${family}.db"
   fi
-  if [[ -f $dest ]]; then
+  if [[ -f $dest && ${PIN_FORCE_DB:-0} != 1 ]]; then
     local age
     age=$(($(date +%s) - $(stat -c %Y "$dest")))
     if ((age < 3600)); then
@@ -408,9 +450,15 @@ ensure_db() {
   fi
   if ! fetch_url "$url" "${dest}.tmp"; then
     rm -f "${dest}.tmp"
+    if [[ -f $dest ]]; then
+      echo "Warning: could not refresh $ch/$family db; using cached copy." >&2
+      printf '%s\n' "$dest"
+      return 0
+    fi
     return 1
   fi
   mv "${dest}.tmp" "$dest"
+  own_cache
   printf '%s\n' "$dest"
 }
 
@@ -452,7 +500,8 @@ cmd_sync() {
 
   local pkg ch info family fn ver sha url inst dest
   local synced=0
-  mkdir -p "$CACHE_DIR"
+  PIN_FORCE_DB=1
+  ensure_cache_dir
   while IFS=$'\t' read -r pkg ch; do
     [[ -z $pkg ]] && continue
     is_channel "$ch" || {
@@ -556,7 +605,35 @@ EOF
   cat >"$HOOK_POST" <<EOF
 #!/bin/bash
 # After omarchy update, pull pinned packages from their channels.
-exec "$BIN_PATH" sync --home "$PIN_HOME"
+set -euo pipefail
+BIN="$BIN_PATH"
+PIN_HOME="$PIN_HOME"
+LOG="\${XDG_STATE_HOME:-\$HOME/.local/state}/omarchy-pkg-pin/post-update.log"
+mkdir -p "\$(dirname "\$LOG")"
+
+if ! sudo -n true 2>/dev/null; then
+  if [[ -t 0 ]]; then
+    sudo -v
+  else
+    echo "omarchy-pkg-pin: sudo timestamp expired; cannot sync pins" >&2
+    if command -v omarchy-notification-send >/dev/null; then
+      omarchy-notification-send -u critical -g ⚠ "Pinned packages not synced" \\
+        "sudo expired during omarchy update. Run: omarchy-pkg-pin sync"
+    fi
+    exit 1
+  fi
+fi
+
+if ! "\$BIN" sync --home "\$PIN_HOME" >"\$LOG" 2>&1; then
+  echo "omarchy-pkg-pin sync failed; see \$LOG" >&2
+  cat "\$LOG" >&2 || true
+  if command -v omarchy-notification-send >/dev/null; then
+    omarchy-notification-send -u critical -g ⚠ "Pinned packages not synced" \\
+      "See \$LOG or run: omarchy-pkg-pin sync"
+  fi
+  exit 1
+fi
+cat "\$LOG"
 EOF
   chmod 755 "$HOOK_PRE" "$HOOK_POST"
 }
@@ -699,12 +776,18 @@ $END_MARK
 
 $OLD_INCLUDE_LINE
 
+[omarchy]
+Server = https://pkgs.omarchy.org/stable/\$arch
+
 [core]
 Include = /etc/pacman.d/mirrorlist
 EOF
   built=$(build_pacman_conf "$sys" "$fake_conf")
   rm -f "$fake_conf"
-  if ! grep -q 'IgnorePkg = hyprland' <<<"$built"; then
+  if [[ $(awk '/^\[/{sec=$0} /^IgnorePkg/{print sec}' <<<"$built" | sort -u) != "[options]" ]]; then
+    echo "FAIL build_pacman_conf put IgnorePkg outside [options]"
+    fail=1
+  elif ! grep -q 'IgnorePkg = hyprland' <<<"$built"; then
     echo "FAIL build_pacman_conf missing IgnorePkg hyprland"
     fail=1
   elif ! grep -q 'IgnorePkg = firefox' <<<"$built"; then
